@@ -26,12 +26,20 @@ local Config = {
 
     -- Re-execute automatically across Lobby <-> Match place teleports
     AutoQueueOnTeleport = true,
+
+    -- Performance, Map Deletion & 3D Rendering Optimization
+    OptimizeFPS = true,
+    DeleteUnneededMap = true,
+    HideOtherPlayersAndBots = true,
+    Disable3DRendering = false,
+    FPSCap = 60,
 }
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -51,6 +59,9 @@ local State = {
     LastExitAt = 0,
     LastPortalEnterAt = os.clock() + 12.0,
     LastLobbyJoinAt = 0,
+    LastOptimizeAt = 0,
+    EngineOptimized = false,
+    OptHooksInstalled = false,
     CurrentNightId = nil,
     LuckyCharmUsedNightId = nil,
     LanternUsedRoundId = nil,
@@ -99,6 +110,8 @@ local State = {
         DoorWave = 0,
         ActiveDoors = {},
         RevealedDoors = {},
+        TakenDoors = {},
+        HiddenDoors = {},
         SniffDoorId = nil,
         LanternDoorId = nil,
         CommittedDoorId = nil,
@@ -180,6 +193,18 @@ local function getModules()
     return nil
 end
 
+local function getActiveInstanceModel()
+    local m = getModules()
+    local inst = m and m.HalloweenGamesCmds and m.HalloweenGamesCmds.Instance()
+    if inst and inst.model then
+        return inst.model
+    end
+    local things = workspace:FindFirstChild("__THINGS")
+    local container = things and things:FindFirstChild("__INSTANCE_CONTAINER")
+    local active = container and container:FindFirstChild("Active")
+    return active and active:FindFirstChild("HalloweenGames") or nil
+end
+
 local function resetRoundState(roundId, arena, info)
     local r = State.Round
     r.Id = roundId
@@ -219,6 +244,8 @@ local function resetRoundState(roundId, arena, info)
     r.DoorWave = 0
     table.clear(r.ActiveDoors)
     table.clear(r.RevealedDoors)
+    table.clear(r.TakenDoors)
+    table.clear(r.HiddenDoors)
     r.SniffDoorId = nil
     r.LanternDoorId = nil
     r.CommittedDoorId = nil
@@ -258,6 +285,351 @@ local function tryEnableNativeAutopilot(roundName, roundMod)
         pcall(setupval, roundMod.Autopilot, 2, nil)
     end
     return false
+end
+
+-- ============================================================================
+-- FPS, MAP DELETION & 3D RENDERING OPTIMIZER
+-- ============================================================================
+local THINGS_BLOAT_FOLDERS = {
+    "Breakables",
+    "Pets",
+    "Orbs",
+    "Lootbags",
+    "RenderedEggs",
+    "CustomEggs",
+    "VFX",
+    "AnimatedBreakables",
+    "Booths",
+    "Flags",
+    "Hoverboards",
+    "RandomEvents",
+    "Chests",
+    "Shinies",
+    "Ultimates",
+}
+
+local WORLD_BLOAT_NAMES = {
+    "Map",
+    "Zone 1",
+    "GREYBOX_WIP",
+    "PSX Hall",
+    "Border",
+    "FlyBorder",
+}
+
+local HG_ACTIVE_DELETE_NAMES = {
+    "Map",
+    "Border",
+    "BREAK_ZONES",
+    "INTERACT",
+}
+
+local LOBBY_MODELS_KEEP = {
+    Pad = true,
+    GROUND = true,
+    Board = true,
+    TeleportHide = true,
+    Billboard = true,
+    RemainingPlayers = true,
+    RemainingIcons = true,
+    Animations = true,
+}
+
+local function simplifyVisualTree(root)
+    if not root then
+        return
+    end
+    for _, desc in ipairs(root:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            if not desc:GetAttribute("HGOpt") then
+                desc:SetAttribute("HGOpt", true)
+                desc.Material = Enum.Material.SmoothPlastic
+                desc.CastShadow = false
+                desc.Reflectance = 0
+            end
+        elseif desc:IsA("ParticleEmitter") or desc:IsA("Trail") or desc:IsA("Beam") or desc:IsA("Fire") or desc:IsA("Smoke") or desc:IsA("Sparkles") then
+            desc.Enabled = false
+        elseif desc:IsA("PointLight") or desc:IsA("SpotLight") or desc:IsA("SurfaceLight") then
+            desc.Enabled = false
+        elseif desc:IsA("Decal") or desc:IsA("Texture") then
+            desc.Transparency = 1
+        end
+    end
+end
+
+local function applyEngineOptimization()
+    if State.EngineOptimized then
+        return
+    end
+    State.EngineOptimized = true
+
+    pcall(function()
+        RunService:Set3dRenderingEnabled(not Config.Disable3DRendering)
+    end)
+    table.insert(State.Restorers, function()
+        pcall(function()
+            RunService:Set3dRenderingEnabled(true)
+        end)
+    end)
+
+    if Config.FPSCap and tonumber(Config.FPSCap) and tonumber(Config.FPSCap) > 0 then
+        local capFn = setfpscap or set_fps_cap
+        if type(capFn) == "function" then
+            pcall(capFn, tonumber(Config.FPSCap))
+        end
+    end
+
+    if not Config.OptimizeFPS then
+        return
+    end
+
+    pcall(function()
+        settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+    end)
+
+    pcall(function()
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 9e9
+        Lighting.ShadowSoftness = 0
+        for _, child in ipairs(Lighting:GetChildren()) do
+            if child:IsA("PostEffect") or child:IsA("Atmosphere") or child:IsA("Clouds") or child:IsA("Sky") then
+                if child:IsA("PostEffect") then
+                    child.Enabled = false
+                else
+                    child:Destroy()
+                end
+            end
+        end
+    end)
+
+    pcall(function()
+        local terrain = workspace:FindFirstChildOfClass("Terrain")
+        if terrain then
+            terrain.WaterWaveSize = 0
+            terrain.WaterWaveSpeed = 0
+            terrain.WaterReflectance = 0
+            terrain.WaterTransparency = 0
+            for _, child in ipairs(terrain:GetChildren()) do
+                if child:IsA("Clouds") then
+                    child:Destroy()
+                end
+            end
+            terrain:Clear()
+        end
+    end)
+end
+
+local function installOptimizationHooks()
+    if State.OptHooksInstalled or not Config.OptimizeFPS then
+        return
+    end
+    local lib = ReplicatedStorage:FindFirstChild("Library")
+    local clientLib = lib and lib:FindFirstChild("Client")
+    local hgCmds = clientLib and clientLib:FindFirstChild("HalloweenGamesCmds")
+    if not hgCmds then
+        return
+    end
+    State.OptHooksInstalled = true
+
+    -- Suppress HalloweenGamesCmds.Fx particles & screen shakes
+    local fxScript = hgCmds:FindFirstChild("Fx")
+    local okFx, fxMod = pcall(function()
+        return fxScript and require(fxScript)
+    end)
+    if okFx and type(fxMod) == "table" then
+        for _, fnName in ipairs({ "Burst", "Celebrate", "Through", "RoundStart", "Countdown", "Poof" }) do
+            local orig = fxMod[fnName]
+            if type(orig) == "function" then
+                fxMod[fnName] = function() end
+                table.insert(State.Restorers, function()
+                    fxMod[fnName] = orig
+                end)
+            end
+        end
+        local origEmitter = fxMod.Emitter
+        if type(origEmitter) == "function" then
+            fxMod.Emitter = function(...)
+                local em = origEmitter(...)
+                if em and typeof(em) == "Instance" and em:IsA("ParticleEmitter") then
+                    em.Enabled = false
+                    em.Rate = 0
+                end
+                return em
+            end
+            table.insert(State.Restorers, function()
+                fxMod.Emitter = origEmitter
+            end)
+        end
+    end
+
+    -- Suppress CurrencyBurst particle bursts
+    local cbScript = clientLib:FindFirstChild("CurrencyBurst")
+    local okCb, cbMod = pcall(function()
+        return cbScript and require(cbScript)
+    end)
+    if okCb and type(cbMod) == "table" and type(cbMod.Play) == "function" then
+        local origPlay = cbMod.Play
+        cbMod.Play = function()
+            return 0
+        end
+        table.insert(State.Restorers, function()
+            cbMod.Play = origPlay
+        end)
+    end
+
+    -- Suppress 19-bot 8-limb BulkMoveTo animations every RenderStepped while preserving PrimaryPart for HotPumpkin
+    if Config.HideOtherPlayersAndBots then
+        local rigsScript = hgCmds:FindFirstChild("Rigs")
+        local okRigs, rigsMod = pcall(function()
+            return rigsScript and require(rigsScript)
+        end)
+        if okRigs and type(rigsMod) == "table" then
+            if type(rigsMod.Update) == "function" then
+                local origUpdate = rigsMod.Update
+                rigsMod.Update = function(_, model, cf)
+                    if model and model.PrimaryPart and typeof(cf) == "CFrame" then
+                        model.PrimaryPart.CFrame = cf * CFrame.new(0, 3, 0)
+                    end
+                end
+                table.insert(State.Restorers, function()
+                    rigsMod.Update = origUpdate
+                end)
+            end
+            if type(rigsMod.Poof) == "function" then
+                local origPoof = rigsMod.Poof
+                rigsMod.Poof = function() end
+                table.insert(State.Restorers, function()
+                    rigsMod.Poof = origPoof
+                end)
+            end
+        end
+    end
+end
+
+local function stepOptimization()
+    if not (Config.OptimizeFPS or Config.DeleteUnneededMap or Config.HideOtherPlayersAndBots) then
+        return
+    end
+    local now = os.clock()
+    if (now - State.LastOptimizeAt) < 2.0 then
+        return
+    end
+    State.LastOptimizeAt = now
+
+    installOptimizationHooks()
+
+    -- 1. Clear temporary debris
+    local debris = workspace:FindFirstChild("__DEBRIS")
+    if debris then
+        for _, child in ipairs(debris:GetChildren()) do
+            pcall(child.Destroy, child)
+        end
+    end
+
+    -- 2. Hide other players & bot rigs while keeping HumanoidRootPart / PrimaryPart for HotPumpkin
+    if Config.HideOtherPlayersAndBots then
+        local botsFolder = workspace:FindFirstChild("HalloweenGamesBots")
+        if botsFolder then
+            for _, botModel in ipairs(botsFolder:GetChildren()) do
+                local pp = botModel:IsA("Model") and botModel.PrimaryPart or nil
+                for _, child in ipairs(botModel:GetChildren()) do
+                    if child == pp then
+                        child.Transparency = 1
+                        child.CastShadow = false
+                    else
+                        pcall(child.Destroy, child)
+                    end
+                end
+            end
+        end
+
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and plr.Character then
+                for _, desc in ipairs(plr.Character:GetDescendants()) do
+                    if desc:IsA("BasePart") then
+                        desc.Transparency = 1
+                        desc.CastShadow = false
+                    elseif desc:IsA("Decal") or desc:IsA("Texture") then
+                        desc.Transparency = 1
+                    elseif desc:IsA("Accessory") or desc:IsA("Clothing") or desc:IsA("ShirtGraphic") or desc:IsA("CharacterMesh") then
+                        pcall(desc.Destroy, desc)
+                    elseif desc:IsA("ParticleEmitter") or desc:IsA("Trail") or desc:IsA("Beam") or desc:IsA("BillboardGui") then
+                        pcall(desc.Destroy, desc)
+                    end
+                end
+            end
+        end
+    end
+
+    if not Config.DeleteUnneededMap then
+        return
+    end
+
+    -- 3. Clean World 1 / Match Place bloat folders
+    local things = workspace:FindFirstChild("__THINGS")
+    if things then
+        for _, folderName in ipairs(THINGS_BLOAT_FOLDERS) do
+            local f = things:FindFirstChild(folderName)
+            if f then
+                for _, child in ipairs(f:GetChildren()) do
+                    pcall(child.Destroy, child)
+                end
+            end
+        end
+    end
+
+    for _, name in ipairs(WORLD_BLOAT_NAMES) do
+        local obj = workspace:FindFirstChild(name)
+        if obj then
+            pcall(obj.Destroy, obj)
+        end
+    end
+
+    -- 4. Clean inside Active.HalloweenGames (preserve ArenaSlots, Hub.Circle/Model, Teleports, ZONE_GROUND, SAFETY_NET)
+    local activeModel = getActiveInstanceModel()
+    if activeModel then
+        for _, delName in ipairs(HG_ACTIVE_DELETE_NAMES) do
+            local target = activeModel:FindFirstChild(delName)
+            if target then
+                pcall(target.Destroy, target)
+            end
+        end
+        local hub = activeModel:FindFirstChild("Hub")
+        if hub then
+            local props = hub:FindFirstChild("Props")
+            if props then
+                pcall(props.Destroy, props)
+            end
+            simplifyVisualTree(hub)
+        end
+        local zg = activeModel:FindFirstChild("ZONE_GROUND")
+        if zg then
+            simplifyVisualTree(zg)
+        end
+        local slots = activeModel:FindFirstChild("ArenaSlots")
+        if slots then
+            simplifyVisualTree(slots)
+        end
+    end
+
+    -- 5. Clean Multiplayer Queue Lobby ("Want to Play? Join Here!")
+    local models = workspace:FindFirstChild("Models")
+    local netFolder = ReplicatedStorage:FindFirstChild("Network")
+    if models and netFolder and netFolder:FindFirstChild("RequestRegister") then
+        for _, child in ipairs(models:GetChildren()) do
+            if not LOBBY_MODELS_KEEP[child.Name] then
+                pcall(child.Destroy, child)
+            end
+        end
+        local padModel = models:FindFirstChild("Pad")
+        if padModel then
+            simplifyVisualTree(padModel)
+        end
+        local groundModel = models:FindFirstChild("GROUND")
+        if groundModel then
+            simplifyVisualTree(groundModel)
+        end
+    end
 end
 
 -- ============================================================================
@@ -1186,6 +1558,20 @@ local function findDoorBoothTrigger(arena, doorId, directDoorsMap)
     return nil
 end
 
+local function isDoorPickable(doorId)
+    local r = State.Round
+    if r.RevealedDoors[doorId] == "trick" then
+        return false
+    end
+    if r.TakenDoors[doorId] == true then
+        return false
+    end
+    if r.HiddenDoors[doorId] ~= nil then
+        return false
+    end
+    return true
+end
+
 local function chooseBestDoorId()
     local r = State.Round
     if #r.ActiveDoors == 0 then
@@ -1194,22 +1580,36 @@ local function chooseBestDoorId()
 
     local candidates = {}
     for _, doorId in ipairs(r.ActiveDoors) do
-        if doorId ~= r.LanternDoorId and r.RevealedDoors[doorId] ~= "trick" then
+        if doorId ~= r.LanternDoorId and isDoorPickable(doorId) then
             table.insert(candidates, doorId)
         end
     end
 
     if #candidates == 0 then
+        -- Fallback to any pickable door even if Lantern flagged it (shouldn't happen unless 1 door)
+        for _, doorId in ipairs(r.ActiveDoors) do
+            if isDoorPickable(doorId) then
+                return doorId
+            end
+        end
         return r.ActiveDoors[1]
     end
 
-    -- Prefer doors not flagged by SniffHint ("smells funny" = likely trick) and not yet opened
+    -- 1. Prefer doors already revealed as "treat" that are still pickable
+    for _, doorId in ipairs(candidates) do
+        if r.RevealedDoors[doorId] == "treat" and doorId ~= r.SniffDoorId then
+            return doorId
+        end
+    end
+
+    -- 2. Prefer unopened doors not flagged by SniffHint ("smells funny" = likely trick)
     for _, doorId in ipairs(candidates) do
         if doorId ~= r.SniffDoorId and r.RevealedDoors[doorId] == nil then
             return doorId
         end
     end
 
+    -- 3. Any candidate not flagged by SniffHint
     for _, doorId in ipairs(candidates) do
         if doorId ~= r.SniffDoorId then
             return doorId
@@ -1235,41 +1635,61 @@ local function stepTrickOrTreatDoors(nightMod)
     end
 
     local directDoorsMap = nil
+    local setPreviewFn = nil
     if type(getupval) == "function" and type(origFn) == "function" then
-        local _, u83 = pcall(getupval, origFn, 1)  -- activeDoors array
-        local _, u85 = pcall(getupval, origFn, 3)  -- revealedDoors map
-        local _, u86 = pcall(getupval, origFn, 4)  -- doorPhase string
-        local _, u87 = pcall(getupval, origFn, 11) -- committedDoorId
-        local _, u93 = pcall(getupval, origFn, 16) -- sniffDoorId
-        local _, u94 = pcall(getupval, origFn, 18) -- lanternTrickDoorId
-        local _, u82 = pcall(getupval, origFn, 20) -- doorsMap
+        -- Verified TrickOrTreatDoors.OnState upvalue layout:
+        -- #1 u83 (activeDoors array), #2 u84 (activeMap), #3 u85 (revealedMap),
+        -- #4 u86 (takenDoors map!), #5 u87 (doorPhase string!),
+        -- #10 u105 (waveIndex), #12 u88 (committedDoorId!),
+        -- #15 setPreview(doorId), #17 u94 (sniffDoorId!),
+        -- #19 u95 (lanternDoorId!), #21 u82 (doorsMap!), #23 u99 (hiddenDoorsMap!)
+        local _, u83 = pcall(getupval, origFn, 1)
+        local _, u85 = pcall(getupval, origFn, 3)
+        local _, u86 = pcall(getupval, origFn, 4)
+        local _, u87 = pcall(getupval, origFn, 5)
+        local _, u105 = pcall(getupval, origFn, 10)
+        local _, u88 = pcall(getupval, origFn, 12)
+        local _, spFn = pcall(getupval, origFn, 15)
+        local _, u94 = pcall(getupval, origFn, 17)
+        local _, u95 = pcall(getupval, origFn, 19)
+        local _, u82 = pcall(getupval, origFn, 21)
+        local _, u99 = pcall(getupval, origFn, 23)
+
         if type(u83) == "table" and #u83 > 0 then
             r.ActiveDoors = u83
         end
         if type(u85) == "table" then
             r.RevealedDoors = u85
         end
-        if type(u86) == "string" and u86 ~= "" then
-            r.DoorPhase = u86
+        if type(u86) == "table" then
+            r.TakenDoors = u86
         end
-        r.CommittedDoorId = u87
-        if tonumber(u93) then
-            r.SniffDoorId = tonumber(u93)
+        if type(u87) == "string" and u87 ~= "" then
+            r.DoorPhase = u87
         end
-        if tonumber(u94) then
-            r.LanternDoorId = tonumber(u94)
+        if tonumber(u105) and tonumber(u105) > 0 then
+            r.DoorWave = tonumber(u105)
         end
+        r.CommittedDoorId = u88
+        if type(spFn) == "function" then
+            setPreviewFn = spFn
+        end
+        r.SniffDoorId = tonumber(u94) or r.SniffDoorId
+        r.LanternDoorId = tonumber(u95) or r.LanternDoorId
         if type(u82) == "table" then
             directDoorsMap = u82
         end
+        if type(u99) == "table" then
+            r.HiddenDoors = u99
+        end
     end
 
-    if r.DoorPhase ~= "pick" or r.CommittedDoorId ~= nil then
+    if (r.DoorPhase ~= "pick" and r.DoorPhase ~= "sniff") or r.CommittedDoorId ~= nil then
         return
     end
 
     local m = getModules()
-    if Config.AutoUseLanternInFinal and m and m.HalloweenGames then
+    if Config.AutoUseLanternInFinal and m and m.HalloweenGames and r.DoorPhase == "pick" then
         local nState = nightMod.State()
         local waveKey = tostring(nState.roundId) .. "_" .. tostring(r.DoorWave)
         if State.LanternUsedRoundId ~= waveKey and hasTrickItem(m.HalloweenGames.TRICKS.Lantern) then
@@ -1286,18 +1706,26 @@ local function stepTrickOrTreatDoors(nightMod)
 
     local trig = findDoorBoothTrigger(r.Arena, targetDoorId, directDoorsMap)
     if trig then
+        -- Stand right inside the trigger box (same check as TrickOrTreatDoors.step(): |X|<=Size.X/2, |Z|<=Size.Z/2)
         local targetPos = Vector3.new(trig.Position.X, hrp.Position.Y, trig.Position.Z)
         local dist = Vector3.new(targetPos.X - hrp.Position.X, 0, targetPos.Z - hrp.Position.Z).Magnitude
-        if dist > 4.0 then
+        if dist > 2.2 then
             hrp.CFrame = CFrame.new(targetPos) * hrp.CFrame.Rotation
             hum:MoveTo(targetPos)
+        else
+            hum:MoveTo(targetPos)
         end
-        if (os.clock() - r.LastCommitAt) > 0.35 then
-            r.LastCommitAt = os.clock()
-            nightMod.Input("CommitDoor", { doorId = targetDoorId })
+        if r.DoorPhase == "pick" then
+            if type(setPreviewFn) == "function" then
+                pcall(setPreviewFn, targetDoorId)
+            end
+            if (os.clock() - r.LastCommitAt) > 0.32 then
+                r.LastCommitAt = os.clock()
+                nightMod.Input("CommitDoor", { doorId = targetDoorId })
+            end
         end
-    else
-        if (os.clock() - r.LastCommitAt) > 0.45 then
+    elseif r.DoorPhase == "pick" then
+        if (os.clock() - r.LastCommitAt) > 0.4 then
             r.LastCommitAt = os.clock()
             nightMod.Input("CommitDoor", { doorId = targetDoorId })
         end
@@ -1468,6 +1896,7 @@ local function handleRoundOnState(roundName, packet)
             r.DoorWave = (tonumber(data.waveIndex) or (r.DoorWave + 1))
             r.ActiveDoors = data.doors or {}
             table.clear(r.RevealedDoors)
+            table.clear(r.TakenDoors)
             r.SniffDoorId = nil
             r.LanternDoorId = nil
             r.CommittedDoorId = nil
@@ -1476,6 +1905,8 @@ local function handleRoundOnState(roundName, packet)
             r.SniffDoorId = data.doorId
         elseif ev == "lantern" then
             r.LanternDoorId = data.doorId
+        elseif ev == "taken" and data.doorId then
+            r.TakenDoors[data.doorId] = true
         elseif ev == "pick" then
             r.DoorPhase = "pick"
         elseif ev == "DoorRevealed" and data.doorId then
@@ -1568,18 +1999,6 @@ end
 -- ============================================================================
 -- CORE LOBBY / MATCH LOOP
 -- ============================================================================
-local function getActiveInstanceModel()
-    local m = getModules()
-    local inst = m and m.HalloweenGamesCmds and m.HalloweenGamesCmds.Instance()
-    if inst and inst.model then
-        return inst.model
-    end
-    local things = workspace:FindFirstChild("__THINGS")
-    local container = things and things:FindFirstChild("__INSTANCE_CONTAINER")
-    local active = container and container:FindFirstChild("Active")
-    return active and active:FindFirstChild("HalloweenGames") or nil
-end
-
 local function getCirclePart()
     local model = getActiveInstanceModel()
     if not model then
@@ -1749,10 +2168,41 @@ local function syncRoundFromNightState(activeModel, nState)
     end
 end
 
+local function isOngoingMatchSpectator(nightMod, nightSelectMod)
+    if nightSelectMod and type(nightSelectMod.Circle) == "function" then
+        local getupval = (debug and debug.getupvalue) or getupvalue
+        if type(getupval) == "function" then
+            local okU, u55 = pcall(getupval, nightSelectMod.Circle, 1)
+            if okU and type(u55) == "table" and u55.phase == "wait" and type(u55.reason) == "string" then
+                if string.find(string.lower(u55.reason), "match is on") then
+                    return true
+                end
+            end
+        end
+    end
+    local nState = nightMod and nightMod.State() or {}
+    if type(nState.banner) == "string" and string.find(string.lower(nState.banner), "match is on") then
+        return true
+    end
+    local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local hgHud = pgui and pgui:FindFirstChild("HalloweenGamesHud")
+    if hgHud then
+        for _, desc in ipairs(hgHud:GetDescendants()) do
+            if desc:IsA("TextLabel") and desc.Visible and string.find(string.lower(desc.Text), "match is on") then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 local function stepMainLoop()
     if not Config.Enabled or not State.Running then
         return
     end
+
+    applyEngineOptimization()
+    stepOptimization()
 
     local _, hrp, hum = getCharacter()
     if not (hrp and hum) then
@@ -1767,13 +2217,14 @@ local function stepMainLoop()
     -- 2. Check if inside HalloweenGames instance
     local activeModel = getActiveInstanceModel()
     if not activeModel then
-        if Config.AutoEnterInstance and (os.clock() - State.LastPortalEnterAt) > 3.0 then
+        -- Only use World 1 portal when NOT in a dedicated match place
+        if Config.AutoEnterInstance and not isDedicatedMatchPlace() and (os.clock() - State.LastPortalEnterAt) > 3.0 then
             local things = workspace:FindFirstChild("__THINGS")
             local instances = things and things:FindFirstChild("Instances")
             local hgPortal = instances and instances:FindFirstChild("HalloweenGames")
             local teleports = hgPortal and hgPortal:FindFirstChild("Teleports")
             local enterPart = teleports and teleports:FindFirstChild("Enter")
-            if enterPart and enterPart:IsA("BasePart") and (hrp.Position - enterPart.Position).Magnitude < 500 then
+            if enterPart and enterPart:IsA("BasePart") then
                 State.LastPortalEnterAt = os.clock()
                 log("Entering HalloweenGames portal")
                 hrp.CFrame = enterPart.CFrame + Vector3.new(0, 3, 0)
@@ -1795,6 +2246,24 @@ local function stepMainLoop()
 
     if not inActiveNight then
         closeEliminatedScreenIfOpen(nightMod)
+
+        -- Recover if character is falling into void while waiting in match server
+        if hrp.Position.Y < -200 then
+            local circle = getCirclePart()
+            if circle then
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.CFrame = CFrame.new(circle.Position + Vector3.new(0, 5, 0))
+            end
+        end
+
+        if isOngoingMatchSpectator(nightMod, m.NightSelect) then
+            if (os.clock() - State.LastExitAt) > 3.0 then
+                State.LastExitAt = os.clock()
+                log("Ongoing match spectator detected, exiting to Queue Lobby")
+                pcall(nightMod.MatchExit)
+            end
+            return
+        end
 
         if nState.phase == "ended" and (isDedicatedMatchPlace() or nState.match == true) then
             if (os.clock() - State.LastExitAt) > 3.0 then
